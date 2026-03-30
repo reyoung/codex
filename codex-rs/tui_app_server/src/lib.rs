@@ -117,6 +117,7 @@ mod key_hint;
 mod line_truncation;
 pub mod live_wrap;
 mod local_chatgpt_auth;
+mod loop_mode;
 mod markdown;
 mod markdown_render;
 mod markdown_stream;

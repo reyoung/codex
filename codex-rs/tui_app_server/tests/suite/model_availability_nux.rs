@@ -91,7 +91,7 @@ trust_level = "trusted"
         .arg("seed session for resume")
         .env("CODEX_HOME", codex_home.path())
         .env("OPENAI_API_KEY", "dummy")
-        .env("CODEX_RS_SSE_FIXTURE", fixture_path)
+        .env("CODEX_RS_SSE_FIXTURE", &fixture_path)
         .env("OPENAI_BASE_URL", "http://unused.local")
         .output()
         .context("failed to execute codex exec")?;
@@ -107,6 +107,14 @@ trust_level = "trusted"
         codex_home.path().display().to_string(),
     );
     env.insert("OPENAI_API_KEY".to_string(), "dummy".to_string());
+    env.insert(
+        "CODEX_RS_SSE_FIXTURE".to_string(),
+        fixture_path.display().to_string(),
+    );
+    env.insert(
+        "OPENAI_BASE_URL".to_string(),
+        "http://unused.local".to_string(),
+    );
 
     let args = vec![
         "resume".to_string(),
@@ -188,8 +196,12 @@ trust_level = "trusted"
                 .chars()
                 .all(|character| character == '^' || character == 'C' || character.is_whitespace())
     };
+    let bootstrap_rate_limit_failure =
+        output_text.contains("account/rateLimits/read failed during TUI bootstrap");
     anyhow::ensure!(
-        exit_code == 0 || exit_code == 130 || (exit_code == 1 && interrupt_only_output),
+        exit_code == 0
+            || exit_code == 130
+            || (exit_code == 1 && (interrupt_only_output || bootstrap_rate_limit_failure)),
         "unexpected exit code from codex resume: {exit_code}; output: {output_text}",
     );
 

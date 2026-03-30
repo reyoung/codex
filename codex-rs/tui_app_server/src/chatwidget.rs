@@ -328,6 +328,12 @@ use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::WebSearchCell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
+use crate::loop_mode::LoopMessageState;
+use crate::loop_mode::loop_started_message;
+use crate::loop_mode::loop_timeout_message;
+use crate::loop_mode::loop_usage;
+use crate::loop_mode::parse_loop_command_args;
+use crate::loop_mode::split_task_text;
 #[cfg(test)]
 use crate::markdown::append_markdown;
 use crate::render::Insets;
@@ -837,6 +843,8 @@ pub(crate) struct ChatWidget {
     suppress_initial_user_message_submit: bool,
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<UserMessage>,
+    // Currently armed `/loop` submission, including its retry schedule.
+    active_loop: Option<ActiveLoopState>,
     // User messages that tried to steer a non-regular turn and must be retried first.
     rejected_steers_queue: VecDeque<UserMessage>,
     // Steers already submitted to core but not yet committed into history.
@@ -992,6 +1000,7 @@ pub(crate) struct UserMessage {
     remote_image_urls: Vec<String>,
     text_elements: Vec<TextElement>,
     mention_bindings: Vec<MentionBinding>,
+    loop_state: Option<LoopMessageState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -1021,10 +1030,77 @@ pub(crate) struct ThreadInputState {
     pending_steers: VecDeque<UserMessage>,
     rejected_steers_queue: VecDeque<UserMessage>,
     queued_user_messages: VecDeque<UserMessage>,
+    active_loop: Option<ActiveLoopState>,
     current_collaboration_mode: CollaborationMode,
     active_collaboration_mask: Option<CollaborationModeMask>,
     task_running: bool,
     agent_turn_running: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ActiveLoopState {
+    user_message: UserMessage,
+    next_retry_at: Instant,
+    deadline: Instant,
+}
+
+impl ActiveLoopState {
+    fn new(user_message: UserMessage, now: Instant) -> Option<Self> {
+        let loop_state = user_message.loop_state.as_ref()?;
+        Some(Self {
+            next_retry_at: now + loop_state.interval(),
+            deadline: now + loop_state.timeout(),
+            user_message,
+        })
+    }
+
+    fn interval(&self) -> Duration {
+        match self.user_message.loop_state.as_ref() {
+            Some(loop_state) => loop_state.interval(),
+            None => panic!("active /loop state should include loop metadata"),
+        }
+    }
+
+    fn timeout(&self) -> Duration {
+        match self.user_message.loop_state.as_ref() {
+            Some(loop_state) => loop_state.timeout(),
+            None => panic!("active /loop state should include loop metadata"),
+        }
+    }
+
+    fn marker_path(&self) -> &Path {
+        match self.user_message.loop_state.as_ref() {
+            Some(loop_state) => loop_state.marker_path(),
+            None => panic!("active /loop state should include loop metadata"),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.user_message
+            .loop_state
+            .as_ref()
+            .is_some_and(LoopMessageState::is_complete)
+    }
+
+    fn schedule_next_retry(&mut self, now: Instant) {
+        self.next_retry_at = now + self.interval();
+    }
+
+    fn wake_in(&self, now: Instant, task_running: bool) -> Option<Duration> {
+        if self.is_complete() || now >= self.deadline {
+            return None;
+        }
+
+        let wake_at = if now < self.next_retry_at {
+            self.next_retry_at.min(self.deadline)
+        } else if task_running {
+            self.deadline
+        } else {
+            return None;
+        };
+
+        Some(wake_at.saturating_duration_since(now))
+    }
 }
 
 impl From<String> for UserMessage {
@@ -1036,6 +1112,7 @@ impl From<String> for UserMessage {
             // Plain text conversion has no UI element ranges.
             text_elements: Vec::new(),
             mention_bindings: Vec::new(),
+            loop_state: None,
         }
     }
 }
@@ -1049,6 +1126,7 @@ impl From<&str> for UserMessage {
             // Plain text conversion has no UI element ranges.
             text_elements: Vec::new(),
             mention_bindings: Vec::new(),
+            loop_state: None,
         }
     }
 }
@@ -1081,6 +1159,7 @@ pub(crate) fn create_initial_user_message(
             remote_image_urls: Vec::new(),
             text_elements,
             mention_bindings: Vec::new(),
+            loop_state: None,
         })
     }
 }
@@ -1111,6 +1190,7 @@ fn remap_placeholders_for_message(message: UserMessage, next_label: &mut usize) 
         local_images,
         remote_image_urls,
         mention_bindings,
+        loop_state,
     } = message;
     if local_images.is_empty() {
         return UserMessage {
@@ -1119,6 +1199,7 @@ fn remap_placeholders_for_message(message: UserMessage, next_label: &mut usize) 
             local_images,
             remote_image_urls,
             mention_bindings,
+            loop_state,
         };
     }
 
@@ -1175,6 +1256,7 @@ fn remap_placeholders_for_message(message: UserMessage, next_label: &mut usize) 
         remote_image_urls,
         text_elements: rebuilt_elements,
         mention_bindings,
+        loop_state,
     }
 }
 
@@ -1185,6 +1267,7 @@ fn merge_user_messages(messages: Vec<UserMessage>) -> UserMessage {
         local_images: Vec::new(),
         remote_image_urls: Vec::new(),
         mention_bindings: Vec::new(),
+        loop_state: None,
     };
     let total_remote_images = messages
         .iter()
@@ -1202,6 +1285,7 @@ fn merge_user_messages(messages: Vec<UserMessage>) -> UserMessage {
             local_images,
             remote_image_urls,
             mention_bindings,
+            loop_state: _,
         } = remap_placeholders_for_message(message, &mut next_image_label);
         append_text_with_rebased_elements(
             &mut combined.text,
@@ -2305,7 +2389,11 @@ impl ChatWidget {
         let had_pending_steers = !self.pending_steers.is_empty();
         self.refresh_pending_input_preview();
 
-        if !from_replay && !self.has_queued_follow_up_messages() && !had_pending_steers {
+        if !from_replay
+            && self.active_loop.is_none()
+            && !self.has_queued_follow_up_messages()
+            && !had_pending_steers
+        {
             self.maybe_prompt_plan_implementation();
         }
         // Keep this flag for replayed completion events so a subsequent live TurnComplete can
@@ -2798,6 +2886,7 @@ impl ChatWidget {
     fn on_interrupted_turn(&mut self, reason: TurnAbortReason) {
         // Finalize, log a gentle prompt, and clear running state.
         self.finalize_turn();
+        self.active_loop = None;
         let send_pending_steers_immediately = self.submit_pending_steers_after_interrupt;
         self.submit_pending_steers_after_interrupt = false;
         if reason != TurnAbortReason::ReviewEnded {
@@ -2852,6 +2941,7 @@ impl ChatWidget {
             local_images: self.bottom_pane.composer_local_images(),
             remote_image_urls: self.bottom_pane.remote_image_urls(),
             mention_bindings: self.bottom_pane.composer_mention_bindings(),
+            loop_state: None,
         };
 
         let mut to_merge: Vec<UserMessage> = self.rejected_steers_queue.drain(..).collect();
@@ -2878,6 +2968,7 @@ impl ChatWidget {
             remote_image_urls,
             text_elements,
             mention_bindings,
+            loop_state: _,
         } = user_message;
         let local_image_paths = local_images.into_iter().map(|img| img.path).collect();
         self.set_remote_image_urls(remote_image_urls);
@@ -2907,6 +2998,7 @@ impl ChatWidget {
                 .collect(),
             rejected_steers_queue: self.rejected_steers_queue.clone(),
             queued_user_messages: self.queued_user_messages.clone(),
+            active_loop: self.active_loop.clone(),
             current_collaboration_mode: self.current_collaboration_mode.clone(),
             active_collaboration_mask: self.active_collaboration_mask.clone(),
             task_running: self.bottom_pane.is_task_running(),
@@ -2961,6 +3053,8 @@ impl ChatWidget {
                 .collect();
             self.rejected_steers_queue = input_state.rejected_steers_queue;
             self.queued_user_messages = input_state.queued_user_messages;
+            self.active_loop = input_state.active_loop;
+            self.schedule_active_loop_frame();
         } else {
             self.agent_turn_running = false;
             self.pending_steers.clear();
@@ -2974,6 +3068,7 @@ impl ChatWidget {
             );
             self.bottom_pane.set_composer_pending_pastes(Vec::new());
             self.queued_user_messages.clear();
+            self.active_loop = None;
         }
         self.turn_sleep_inhibitor
             .set_turn_running(self.agent_turn_running);
@@ -3866,6 +3961,7 @@ impl ChatWidget {
 
     pub(crate) fn pre_draw_tick(&mut self) {
         self.bottom_pane.pre_draw_tick();
+        self.maybe_run_active_loop();
         if self.should_animate_terminal_title_spinner() {
             self.refresh_terminal_title();
         }
@@ -4508,6 +4604,7 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            active_loop: None,
             rejected_steers_queue: VecDeque::new(),
             pending_steers: VecDeque::new(),
             submit_pending_steers_after_interrupt: false,
@@ -4703,6 +4800,7 @@ impl ChatWidget {
                         mention_bindings: self
                             .bottom_pane
                             .take_recent_submission_mention_bindings(),
+                        loop_state: None,
                     };
                     if user_message.text.is_empty()
                         && user_message.local_images.is_empty()
@@ -4744,6 +4842,7 @@ impl ChatWidget {
                         mention_bindings: self
                             .bottom_pane
                             .take_recent_submission_mention_bindings(),
+                        loop_state: None,
                     };
                     let Some(user_message) =
                         self.maybe_defer_user_message_for_realtime(user_message)
@@ -4893,6 +4992,9 @@ impl ChatWidget {
             }
             SlashCommand::Review => {
                 self.open_review_popup();
+            }
+            SlashCommand::Loop => {
+                self.add_error_message(loop_usage());
             }
             SlashCommand::Rename => {
                 self.session_telemetry
@@ -5259,6 +5361,7 @@ impl ChatWidget {
                     remote_image_urls,
                     text_elements: prepared_elements,
                     mention_bindings: self.bottom_pane.take_recent_submission_mention_bindings(),
+                    loop_state: None,
                 };
                 if self.is_session_configured() {
                     self.reasoning_buffer.clear();
@@ -5283,6 +5386,54 @@ impl ChatWidget {
                     user_facing_hint: None,
                 }));
                 self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::Loop if !trimmed.is_empty() => {
+                let Some((prepared_args, prepared_elements)) = self
+                    .bottom_pane
+                    .prepare_inline_args_submission(/*record_history*/ true)
+                else {
+                    return;
+                };
+                let parsed = match parse_loop_command_args(&prepared_args) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        self.add_error_message(err);
+                        return;
+                    }
+                };
+                let loop_state = match LoopMessageState::create(parsed.interval, parsed.timeout) {
+                    Ok(loop_state) => loop_state,
+                    Err(err) => {
+                        self.add_error_message(err);
+                        return;
+                    }
+                };
+                let (task_text, task_elements) =
+                    split_task_text(prepared_args, prepared_elements, parsed.task_offset());
+                let local_images = self
+                    .bottom_pane
+                    .take_recent_submission_images_with_placeholders();
+                let remote_image_urls = self.take_remote_image_urls();
+                self.add_info_message(
+                    loop_started_message(parsed.interval, parsed.timeout),
+                    /*hint*/ None,
+                );
+                let user_message = UserMessage {
+                    text: task_text,
+                    local_images,
+                    remote_image_urls,
+                    text_elements: task_elements,
+                    mention_bindings: self.bottom_pane.take_recent_submission_mention_bindings(),
+                    loop_state: Some(loop_state),
+                };
+                if self.is_session_configured() {
+                    self.reasoning_buffer.clear();
+                    self.full_reasoning_buffer.clear();
+                    self.set_status_header(String::from("Working"));
+                    self.submit_user_message(user_message);
+                } else {
+                    self.queue_user_message(user_message);
+                }
             }
             SlashCommand::SandboxReadRoot if !trimmed.is_empty() => {
                 let Some((prepared_args, _prepared_elements)) = self
@@ -5392,6 +5543,62 @@ impl ChatWidget {
         }
     }
 
+    fn maybe_run_active_loop(&mut self) {
+        let Some(mut active_loop) = self.active_loop.take() else {
+            return;
+        };
+
+        if active_loop.is_complete() {
+            return;
+        }
+
+        let now = Instant::now();
+        if now >= active_loop.deadline {
+            self.on_warning(loop_timeout_message(active_loop.timeout()));
+            return;
+        }
+
+        if self.bottom_pane.is_task_running() || now < active_loop.next_retry_at {
+            self.active_loop = Some(active_loop);
+            self.schedule_active_loop_frame();
+            return;
+        }
+
+        let user_message = active_loop.user_message.clone();
+        active_loop.schedule_next_retry(now);
+        self.active_loop = Some(active_loop);
+        self.reasoning_buffer.clear();
+        self.full_reasoning_buffer.clear();
+        self.set_status_header(String::from("Working"));
+        self.submit_user_message(user_message);
+    }
+
+    fn schedule_active_loop_frame(&self) {
+        let Some(active_loop) = self.active_loop.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        if let Some(delay) = active_loop.wake_in(now, self.bottom_pane.is_task_running()) {
+            self.frame_requester.schedule_frame_in(delay);
+        }
+    }
+
+    fn activate_loop(&mut self, user_message: UserMessage, now: Instant) {
+        let Some(mut active_loop) = ActiveLoopState::new(user_message, now) else {
+            self.active_loop = None;
+            return;
+        };
+
+        if let Some(existing) = self.active_loop.as_ref()
+            && existing.marker_path() == active_loop.marker_path()
+        {
+            active_loop.deadline = existing.deadline;
+        }
+
+        self.active_loop = Some(active_loop);
+        self.schedule_active_loop_frame();
+    }
+
     fn submit_user_message(&mut self, user_message: UserMessage) {
         if !self.is_session_configured() {
             tracing::warn!("cannot submit user message before session is configured; queueing");
@@ -5405,8 +5612,13 @@ impl ChatWidget {
             remote_image_urls,
             text_elements,
             mention_bindings,
+            loop_state,
         } = user_message;
-        if text.is_empty() && local_images.is_empty() && remote_image_urls.is_empty() {
+        let submitted_text = loop_state.as_ref().map_or_else(
+            || text.clone(),
+            |state| state.completion_submitted_text(&text),
+        );
+        if submitted_text.is_empty() && local_images.is_empty() && remote_image_urls.is_empty() {
             return;
         }
         if (!local_images.is_empty() || !remote_image_urls.is_empty())
@@ -5424,9 +5636,19 @@ impl ChatWidget {
 
         let render_in_history = !self.agent_turn_running;
         let mut items: Vec<UserInput> = Vec::new();
+        let retryable_loop_message = loop_state.clone().map(|loop_state| UserMessage {
+            text: text.clone(),
+            local_images: local_images.clone(),
+            remote_image_urls: remote_image_urls.clone(),
+            text_elements: text_elements.clone(),
+            mention_bindings: mention_bindings.clone(),
+            loop_state: Some(loop_state),
+        });
 
         // Special-case: "!cmd" executes a local shell command instead of sending to the model.
-        if let Some(stripped) = text.strip_prefix('!') {
+        if loop_state.is_none()
+            && let Some(stripped) = submitted_text.strip_prefix('!')
+        {
             let cmd = stripped.trim();
             if cmd.is_empty() {
                 self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
@@ -5453,14 +5675,14 @@ impl ChatWidget {
             });
         }
 
-        if !text.is_empty() {
+        if !submitted_text.is_empty() {
             items.push(UserInput::Text {
-                text: text.clone(),
+                text: submitted_text.clone(),
                 text_elements: text_elements.clone(),
             });
         }
 
-        let mentions = collect_tool_mentions(&text, &HashMap::new());
+        let mentions = collect_tool_mentions(&submitted_text, &HashMap::new());
         let bound_names: HashSet<String> = mention_bindings
             .iter()
             .map(|binding| binding.mention.clone())
@@ -5587,6 +5809,7 @@ impl ChatWidget {
                 remote_image_urls: remote_image_urls.clone(),
                 text_elements: text_elements.clone(),
                 mention_bindings: mention_bindings.clone(),
+                loop_state: loop_state.clone(),
             },
             compare_key: Self::pending_steer_compare_key_from_items(&items),
         });
@@ -5612,6 +5835,12 @@ impl ChatWidget {
 
         if !self.submit_op(op) {
             return;
+        }
+
+        if let Some(user_message) = retryable_loop_message {
+            self.activate_loop(user_message, Instant::now());
+        } else {
+            self.active_loop = None;
         }
 
         // Persist the text to cross-session message history. Mentions are
@@ -6726,6 +6955,7 @@ impl ChatWidget {
                 TurnAbortReason::Replaced => {
                     self.submit_pending_steers_after_interrupt = false;
                     self.pending_steers.clear();
+                    self.active_loop = None;
                     self.refresh_pending_input_preview();
                     self.on_error("Turn aborted: replaced by a new task".to_owned())
                 }
@@ -10114,6 +10344,7 @@ impl ChatWidget {
             remote_image_urls: Vec::new(),
             text_elements: Vec::new(),
             mention_bindings: Vec::new(),
+            loop_state: None,
         };
         if should_queue {
             self.queue_user_message(user_message);

@@ -1252,6 +1252,7 @@ async fn queued_restore_with_remote_images_keeps_local_placeholder_mapping() {
         remote_image_urls: remote_image_urls.clone(),
         text_elements: text_elements.clone(),
         mention_bindings: Vec::new(),
+        loop_state: None,
     });
 
     assert_eq!(chat.bottom_pane.composer_text(), text);
@@ -1297,6 +1298,7 @@ async fn interrupted_turn_restores_queued_messages_with_images_and_elements() {
         remote_image_urls: Vec::new(),
         text_elements: first_elements,
         mention_bindings: Vec::new(),
+        loop_state: None,
     });
     chat.queued_user_messages.push_back(UserMessage {
         text: second_text,
@@ -1307,6 +1309,7 @@ async fn interrupted_turn_restores_queued_messages_with_images_and_elements() {
         remote_image_urls: Vec::new(),
         text_elements: second_elements,
         mention_bindings: Vec::new(),
+        loop_state: None,
     });
     chat.refresh_pending_input_preview();
 
@@ -1377,6 +1380,7 @@ async fn interrupted_turn_restore_keeps_active_mode_for_resubmission() {
         remote_image_urls: Vec::new(),
         text_elements: Vec::new(),
         mention_bindings: Vec::new(),
+        loop_state: None,
     });
     chat.refresh_pending_input_preview();
 
@@ -1439,6 +1443,7 @@ async fn remap_placeholders_uses_attachment_labels() {
         local_images: attachments,
         remote_image_urls: vec!["https://example.com/a.png".to_string()],
         mention_bindings: Vec::new(),
+        loop_state: None,
     };
     let mut next_label = 3usize;
     let remapped = remap_placeholders_for_message(message, &mut next_label);
@@ -1505,6 +1510,7 @@ async fn remap_placeholders_uses_byte_ranges_when_placeholder_missing() {
         local_images: attachments,
         remote_image_urls: Vec::new(),
         mention_bindings: Vec::new(),
+        loop_state: None,
     };
     let mut next_label = 3usize;
     let remapped = remap_placeholders_for_message(message, &mut next_label);
@@ -2082,6 +2088,7 @@ async fn make_chatwidget_manual(
         show_welcome_banner: true,
         startup_tooltip_override: None,
         queued_user_messages: VecDeque::new(),
+        active_loop: None,
         rejected_steers_queue: VecDeque::new(),
         pending_steers: VecDeque::new(),
         submit_pending_steers_after_interrupt: false,
@@ -3902,6 +3909,7 @@ async fn restore_thread_input_state_syncs_sleep_inhibitor_state() {
         pending_steers: VecDeque::new(),
         rejected_steers_queue: VecDeque::new(),
         queued_user_messages: VecDeque::new(),
+        active_loop: None,
         current_collaboration_mode: chat.current_collaboration_mode.clone(),
         active_collaboration_mask: chat.active_collaboration_mask.clone(),
         task_running: true,
@@ -3934,6 +3942,7 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
         pending_steers,
         rejected_steers_queue,
         queued_user_messages,
+        active_loop: None,
         current_collaboration_mode: chat.current_collaboration_mode.clone(),
         active_collaboration_mask: chat.active_collaboration_mask.clone(),
         task_running: false,
@@ -5395,6 +5404,7 @@ async fn item_completed_pops_pending_steer_with_local_image_and_text_elements() 
         remote_image_urls: Vec::new(),
         text_elements,
         mention_bindings: Vec::new(),
+        loop_state: None,
     });
 
     match next_submit_op(&mut op_rx) {
@@ -5500,6 +5510,7 @@ async fn submit_user_message_emits_structured_plugin_mentions_from_bindings() {
             mention: "sample".to_string(),
             path: "plugin://sample@test".to_string(),
         }],
+        loop_state: None,
     });
 
     let Op::UserTurn { items, .. } = next_submit_op(&mut op_rx) else {
@@ -6815,6 +6826,61 @@ async fn plan_slash_command_with_args_submits_prompt_in_plan_mode() {
         }
     );
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
+}
+
+#[tokio::test]
+async fn loop_slash_command_with_args_submits_task_text_and_arms_loop() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+
+    let configured = codex_protocol::protocol::SessionConfiguredEvent {
+        session_id: ThreadId::new(),
+        forked_from_id: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        cwd: PathBuf::from("/home/user/project"),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        network_proxy: None,
+        rollout_path: None,
+    };
+    chat.handle_codex_event(Event {
+        id: "configured".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+
+    chat.bottom_pane.set_composer_text(
+        "/loop 15m --timeout 2h finish the migration".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    };
+    assert_eq!(items.len(), 1);
+    let UserInput::Text {
+        text,
+        text_elements,
+    } = &items[0]
+    else {
+        panic!("expected UserInput::Text, got {:?}", items[0]);
+    };
+    assert!(text.starts_with("finish the migration\n\nThis task is running in `/loop` mode."));
+    assert!(!text.contains("15m --timeout 2h finish the migration"));
+    assert!(text.contains("touch --"));
+    assert!(text.contains("internal to Codex CLI"));
+    assert_eq!(text_elements, &Vec::new());
+    let active_loop = chat.active_loop.as_ref().expect("loop should be armed");
+    assert_eq!(active_loop.user_message.text, "finish the migration");
 }
 
 #[tokio::test]
